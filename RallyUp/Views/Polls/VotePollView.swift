@@ -3,13 +3,11 @@ import FirebaseAuth
 import FirebaseFirestore
 
 struct VotePollView: View {
-    let partyId: String
-    let pollId: String
-
+    private let partyId: String
+    private let pollId: String
     @StateObject private var vm: VoteViewModel
+
     @State private var newOptionText: String = ""
-    @State private var isSubmitting = false
-    @State private var errorText: String?
 
     init(partyId: String, pollId: String) {
         self.partyId = partyId
@@ -18,182 +16,206 @@ struct VotePollView: View {
     }
 
     var body: some View {
-        List {
-            Section {
-                Text(vm.question)
-                    .font(.headline)
-                    .accessibilityLabel("Poll question")
-            }
+        ScrollView {
+            VStack(spacing: 16) {
+                header
 
-            optionsSection
-
-            if vm.allowGuestOptions && !vm.isLocked {
-                Section("Add an option") {
-                    HStack {
-                        TextField("Your option", text: $newOptionText)
-                            .textInputAutocapitalization(.sentences)
-                        Button("Add") { Task { await addGuestOption() } }
-                            .disabled(newOptionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    }
+                switch vm.pollKind {
+                case .ranked: rankedContent
+                case .single, .multiple: choiceContent
                 }
-            }
 
-            if let deadline = vm.deadlineAt {
-                Section {
-                    HStack {
-                        Image(systemName: "hourglass")
-                        Text("Closes \(deadline.formatted(date: .abbreviated, time: .shortened))")
-                    }
-                    .foregroundStyle(.secondary)
-                    .font(.footnote)
-                }
-            }
+                submitButton
 
-            Section {
-                Button(isSubmitting ? "Submitting…" : "Submit Vote") {
-                    Task { await submit() }
-                }
-                .disabled(!vm.canSubmit || isSubmitting || vm.isLocked)
-                .buttonStyle(.borderedProminent)
-                .tint(Theme.teal)
-            }
+                resultsSection
 
-            resultsSection
+                ownerControls
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
         }
-        .listStyle(.insetGrouped)
-        // ✅ Force edit mode ON only for ranked polls (required for .onMove to show drag handles)
-        .environment(\.editMode, .constant(vm.pollKind == .ranked ? EditMode.active : EditMode.inactive))
         .navigationTitle("Vote")
-        .onAppear {
-            Task {
-                await vm.refreshHasVoted()
-                await vm.refreshTallies()
-            }
-        }
-        .alert("Error", isPresented: Binding(get: { errorText != nil }, set: { if !$0 { errorText = nil } })) {
-            Button("OK", role: .cancel) {}
-        } message: { Text(errorText ?? "") }
+        .navigationBarTitleDisplayMode(.inline)
     }
 
     // MARK: - Sections
 
-    @ViewBuilder
-    private var optionsSection: some View {
-        switch vm.pollKind {
-        case .single:
-            Section("Choose one") {
-                ForEach(vm.options) { opt in
-                    Button {
-                        vm.toggleSelect(opt.id)
-                    } label: {
-                        HStack {
-                            Image(systemName: vm.selectedOptionIds.contains(opt.id) ? "largecircle.fill.circle" : "circle")
-                                .imageScale(.large)
-                            Text(opt.text)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    }
-                    .accessibilityLabel(opt.text)
-                    .contentShape(Rectangle())
-                }
-            }
+    private var header: some View {
+        Text(vm.question)
+            .font(.title3.weight(.semibold))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(14)
+            .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
+    }
 
-        case .multiple:
-            Section("Choose one or more") {
-                ForEach(vm.options) { opt in
-                    Toggle(isOn: Binding(
-                        get: { vm.selectedOptionIds.contains(opt.id) },
-                        set: { _ in vm.toggleSelect(opt.id) }
-                    )) {
-                        Text(opt.text)
-                    }
-                    .accessibilityLabel(opt.text)
-                }
-            }
+    private var rankedContent: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Drag to rank (top = best)")
+                .font(.headline)
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-        case .ranked:
-            Section("Drag to rank (top = best)") {
-                // Use a stable ForEach inside the List; .onMove + edit mode shows drag handles
+            // Reorderable list with ONLY the right drag handle
+            List {
                 ForEach(vm.rankedOrder) { opt in
                     HStack {
-                        // A visible “grip” helps users discover reordering
-                        Image(systemName: "line.3.horizontal")
-                            .foregroundStyle(.secondary)
-                            .accessibilityHidden(true)
                         Text(opt.text)
-                            .accessibilityLabel(opt.text)
+                        Spacer()
+                        Image(systemName: "line.3.horizontal") // one handle at right
+                            .opacity(0.35)
+                            .accessibilityHidden(true)
                     }
+                    .contentShape(Rectangle())
                 }
-                .onMove(perform: moveRanked)
-                .moveDisabled(false)
+                .onMove(perform: vm.moveRanked(from:to:))
+            }
+            .environment(\.editMode, .constant(.active))
+            .frame(minHeight: CGFloat(max(1, vm.options.count)) * 56, maxHeight: 360)
+            .listStyle(.plain)
+            .scrollDisabled(true)
+
+            if vm.allowGuestOptions && !vm.isClosed {
+                HStack {
+                    TextField("Add an option", text: $newOptionText)
+                    Button("Add") {
+                        Task {
+                            let t = newOptionText.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !t.isEmpty {
+                                try? await vm.addGuestOption(text: t)
+                                newOptionText = ""
+                            }
+                        }
+                    }.disabled(newOptionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                .padding(12)
+                .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14))
             }
         }
     }
 
-    @ViewBuilder
+    private var choiceContent: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(vm.options) { opt in
+                Button {
+                    vm.toggleSelect(opt.id)
+                } label: {
+                    HStack {
+                        Text(opt.text)
+                            .foregroundStyle(.primary)
+                        Spacer()
+                        if vm.pollKind == .single {
+                            Image(systemName: vm.selectedOptionIds.contains(opt.id) ? "largecircle.fill.circle" : "circle")
+                                .imageScale(.large)
+                                .foregroundStyle(vm.selectedOptionIds.contains(opt.id) ? Theme.teal : .secondary)
+                        } else {
+                            Image(systemName: vm.selectedOptionIds.contains(opt.id) ? "checkmark.square.fill" : "square")
+                                .imageScale(.large)
+                                .foregroundStyle(vm.selectedOptionIds.contains(opt.id) ? Theme.teal : .secondary)
+                        }
+                    }
+                    .padding(12)
+                    .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14))
+                }
+                .buttonStyle(.plain)
+            }
+
+            if vm.allowGuestOptions && !vm.isClosed {
+                HStack {
+                    TextField("Add an option", text: $newOptionText)
+                    Button("Add") {
+                        Task {
+                            let t = newOptionText.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !t.isEmpty {
+                                try? await vm.addGuestOption(text: t)
+                                newOptionText = ""
+                            }
+                        }
+                    }.disabled(newOptionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                .padding(12)
+                .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14))
+            }
+        }
+    }
+
+    private var submitButton: some View {
+        Button {
+            Task { try? await vm.submitVote() }
+        } label: {
+            Text("Submit Vote")
+                .font(.headline)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(Theme.teal)
+        .disabled(!vm.canSubmit)
+        .padding(.top, 4)
+    }
+
     private var resultsSection: some View {
-        if vm.shouldShowResults {
-            Section("Results") {
-                if vm.resultsCounts.isEmpty {
-                    Text("No votes yet").foregroundStyle(.secondary)
-                } else {
-                    ForEach(vm.options) { opt in
-                        let count = vm.resultsCounts[opt.id] ?? 0
-                        let pct = vm.resultsPercentages[opt.id] ?? 0
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack {
-                                Text(opt.text)
-                                Spacer()
-                                Text("\(count) • \(Int(round(pct * 100)))%")
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Results")
+                .font(.headline)
+
+            if vm.shouldShowResults {
+                ForEach(vm.options) { opt in
+                    let raw = vm.percent(for: opt.id)
+                    let frac = raw.isFinite ? max(0, min(1, raw)) : 0
+                    let pct = Int((frac * 100).rounded())
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text(opt.text).font(.subheadline.weight(.semibold))
+                            Spacer()
+                            if vm.pollKind == .ranked {
+                                let score = vm.score(for: opt.id)
+                                Text("\(Int(score)) • \(pct)%")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
-                                    .accessibilityLabel("\(count) votes, \(Int(round(pct * 100))) percent")
+                            } else {
+                                let c = vm.count(for: opt.id)
+                                Text("\(c) • \(pct)%")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
-                            BarMeter(fraction: pct)
-                                .frame(height: 10)
                         }
-                        .padding(.vertical, 4)
+                        BarMeter(fraction: frac)
+                            .frame(height: 10)
                     }
-                    if vm.pollKind == .ranked {
-                        Text("Ranked results use Borda scoring.").font(.footnote).foregroundStyle(.secondary)
-                    }
+                    .padding(.vertical, 6)
+                    .padding(.horizontal, 12)
+                    .background(Color(.tertiarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12))
                 }
-            }
-        } else {
-            Section {
+
+                if vm.pollKind == .ranked {
+                    Text("Ranked results use Borda scoring.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 4)
+                }
+            } else {
                 Text("Results are hidden until you vote or the poll closes.")
                     .foregroundStyle(.secondary)
+                    .font(.subheadline)
+                    .padding(.vertical, 8)
             }
         }
+        .padding(.top, 8)
     }
 
-    // MARK: - Actions
-
-    private func moveRanked(from source: IndexSet, to destination: Int) {
-        vm.rankedOrder.move(fromOffsets: source, toOffset: destination)
-    }
-
-    private func submit() async {
-        isSubmitting = true
-        errorText = nil
-        do {
-            try await vm.submitVote()
-            await vm.refreshHasVoted()
-            await vm.refreshTallies()
-        } catch {
-            errorText = error.localizedDescription
+    private var ownerControls: some View {
+        Group {
+            if vm.isCreator {
+                VStack(alignment: .leading, spacing: 8) {
+                    Divider().padding(.vertical, 8)
+                    Text("Owner Controls").font(.subheadline.weight(.semibold))
+                    Button(vm.isLocked ? "Unlock Poll" : "Lock Poll") {
+                        Task { await vm.toggleLock() }
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
         }
-        isSubmitting = false
-    }
-
-    private func addGuestOption() async {
-        let t = newOptionText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !t.isEmpty else { return }
-        do {
-            try await vm.addGuestOption(text: t)
-            newOptionText = ""
-        } catch {
-            errorText = error.localizedDescription
-        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

@@ -12,10 +12,12 @@ struct PollsListView: View {
     @State private var canManage = false
     @State private var showCreate = false
 
-    // Live listeners
-    @State private var primaryListener: ListenerRegistration? = nil
-    @State private var fallbackListener: ListenerRegistration? = nil
-    @State private var usingFallbackQuery = false
+    @State private var listener: ListenerRegistration? = nil
+
+    // ✅ Explicit, non-private init so other views can construct this.
+    init(partyId: String) {
+        self.partyId = partyId
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -101,56 +103,34 @@ struct PollsListView: View {
     // MARK: - Live listeners
 
     private func startListening() {
-        if primaryListener != nil || fallbackListener != nil { return }
+        if listener != nil { return }
         isLoading = true
         errorMessage = nil
-        usingFallbackQuery = false
         polls.removeAll()
 
-        let primaryQuery = Firestore.firestore()
+        let q = Firestore.firestore()
             .collection("parties").document(partyId)
             .collection("polls")
             .order(by: "createdAt", descending: true)
 
-        primaryListener = primaryQuery.addSnapshotListener { snap, err in
-            if let err { errorMessage = err.localizedDescription; isLoading = false; return }
-            let docs = snap?.documents ?? []
-            if !docs.isEmpty {
-                let mapped = docs.compactMap { self.mapPoll(doc: $0) }
-                DispatchQueue.main.async {
-                    self.polls = mapped
-                    self.isLoading = false
-                    self.usingFallbackQuery = false
-                }
-            } else {
-                // Subcollection empty — also listen on fallback top-level (dev resilience)
-                attachFallbackIfNeeded()
-                DispatchQueue.main.async { self.isLoading = false }
+        listener = q.addSnapshotListener { snap, err in
+            if let err {
+                errorMessage = err.localizedDescription
+                isLoading = false
+                return
             }
-        }
-    }
-
-    private func attachFallbackIfNeeded() {
-        guard fallbackListener == nil else { return }
-        usingFallbackQuery = true
-        let fbQuery = Firestore.firestore()
-            .collection("polls")
-            .whereField("partyId", isEqualTo: partyId)
-
-        fallbackListener = fbQuery.addSnapshotListener { snap, err in
-            if let err { errorMessage = err.localizedDescription; return }
-            var mapped = (snap?.documents ?? []).compactMap { self.mapPoll(doc: $0) }
-            mapped.sort { $0.createdAt > $1.createdAt }
+            let docs = snap?.documents ?? []
+            let mapped = docs.compactMap { self.mapPoll(doc: $0) }
             DispatchQueue.main.async {
-                // Only apply fallback results if primary is still empty.
-                if self.usingFallbackQuery { self.polls = mapped }
+                self.polls = mapped
+                self.isLoading = false
             }
         }
     }
 
     private func stopListening() {
-        primaryListener?.remove(); primaryListener = nil
-        fallbackListener?.remove(); fallbackListener = nil
+        listener?.remove()
+        listener = nil
     }
 
     private func restartListening() {
@@ -171,14 +151,16 @@ struct PollsListView: View {
         )
     }
 
+    /// Owner or admin can manage polls. Reads from root party doc per our rules.
     private func checkManagePermission() {
         guard let uid = Auth.auth().currentUser?.uid, !uid.isEmpty else { return }
         Firestore.firestore()
             .collection("parties").document(partyId)
-            .collection("members").document(uid)
             .addSnapshotListener { snap, _ in
-                let role = (snap?.data()?["role"] as? String) ?? "guest"
-                canManage = (role == "owner" || role == "comanager")
+                let data = snap?.data() ?? [:]
+                let owner = (data["ownerId"] as? String) ?? (data["createdBy"] as? String) ?? ""
+                let admins = (data["admins"] as? [String: Bool]) ?? [:]
+                canManage = (uid == owner) || (admins[uid] == true)
             }
     }
 }

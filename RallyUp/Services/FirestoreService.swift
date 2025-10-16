@@ -20,54 +20,68 @@ final class FirestoreService {
         db.collection("users").document(uid).collection("myParties")
     }
 
+    private func invitesRef() -> CollectionReference {
+        db.collection("invites")
+    }
+
     // MARK: - Parties
 
     func createParty(ownerUid: String,
                      title: String,
                      description: String?,
                      startAt: Date?) async throws -> Party {
+        // Ensure unique join code by checking /invites/{code} (allowed by rules)
         var code = generateJoinCode()
-        for _ in 0..<5 {
-            let snap = try await db.collection("parties")
-                .whereField("joinCode", isEqualTo: code)
-                .limit(to: 1).getDocuments()
-            if snap.documents.isEmpty { break }
+        for _ in 0..<8 {
+            let inviteDoc = try await invitesRef().document(code).getDocument()
+            if !inviteDoc.exists { break } // code is free
             code = generateJoinCode()
         }
 
         let partyRef = db.collection("parties").document()
+        let now = FieldValue.serverTimestamp()
+
         let data: [String: Any] = [
             "ownerId": ownerUid,
+            "createdBy": ownerUid, // <-- add for compatibility
             "title": title,
             "description": description as Any,
             "startAt": startAt.map { Timestamp(date: $0) } as Any,
             "themeColor": "#14B8A6",
             "joinCode": code,
-            "createdAt": FieldValue.serverTimestamp()
+            "createdAt": now,
+            // Root-level membership/admin maps required by rules
+            "members": [ownerUid: true],
+            "admins":  [ownerUid: true],
+            "visibility": "private"
         ]
+
         try await partyRef.setData(data)
 
-        try await partyRef.collection("members").document(ownerUid).setData([
-            "userId": ownerUid,
-            "role": "owner",
-            "status": "joined",
-            "joinedAt": FieldValue.serverTimestamp()
-        ])
-
+        // Compact row for "My Parties"
         try await userPartiesRef(uid: ownerUid).document(partyRef.documentID).setData([
             "title": title,
             "role": "owner",
             "startAt": startAt.map { Timestamp(date: $0) } as Any,
-            "addedAt": FieldValue.serverTimestamp()
+            "addedAt": now
         ])
 
-        return Party(id: partyRef.documentID,
-                     ownerId: ownerUid,
-                     title: title,
-                     description: description,
-                     startAt: startAt,
-                     themeColorHex: "#14B8A6",
-                     joinCode: code)
+        // Public invite mapping: invites/{code} -> partyId
+        try await invitesRef().document(code).setData([
+            "code": code,
+            "partyId": partyRef.documentID,
+            "createdAt": now
+        ])
+
+        return Party(
+            id: partyRef.documentID,
+            ownerId: ownerUid,
+            title: title,
+            description: description,
+            startAt: startAt,
+            themeColorHex: "#14B8A6",
+            joinCode: code
+        )
     }
 
     enum JoinResult { case joined(Party), alreadyMember(Party), notFound }
@@ -76,31 +90,27 @@ final class FirestoreService {
         let code = rawCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         guard !code.isEmpty else { return .notFound }
 
-        let snap = try await db.collection("parties")
-            .whereField("joinCode", isEqualTo: code).limit(to: 1).getDocuments()
-        guard let doc = snap.documents.first else { return .notFound }
+        // 1) Lookup invite
+        let inviteSnap = try await invitesRef().document(code).getDocument()
+        guard let invite = inviteSnap.data(),
+              let partyId = invite["partyId"] as? String else { return .notFound }
 
-        let partyId = doc.documentID
-        let pData = doc.data()
+        // 2) Fetch party
+        let doc = try await db.collection("parties").document(partyId).getDocument()
+        guard let pData = doc.data() else { return .notFound }
 
-        let memberRef = doc.reference.collection("members").document(currentUid)
-        let memberSnap = try await memberRef.getDocument()
-        let already = memberSnap.exists
-
+        // 3) Ensure membership in root map
+        let already = (pData["members"] as? [String: Bool])?[currentUid] == true
         if !already {
-            try await memberRef.setData([
-                "userId": currentUid,
-                "role": "guest",
-                "status": "joined",
-                "joinedAt": FieldValue.serverTimestamp()
-            ])
+            try await doc.reference.setData(["members": [currentUid: true]], merge: true)
         }
 
+        // 4) Add to user's "My Parties"
         let title = (pData["title"] as? String) ?? "Party"
         let startAt = pData["startAt"] as? Timestamp
         try await userPartiesRef(uid: currentUid).document(partyId).setData([
             "title": title,
-            "role": already ? "guest" : "guest",
+            "role": "guest",
             "startAt": startAt as Any,
             "addedAt": FieldValue.serverTimestamp()
         ])
@@ -116,6 +126,8 @@ final class FirestoreService {
         )
         return already ? .alreadyMember(party) : .joined(party)
     }
+
+    // --- rest of file unchanged (RSVP + Polls API) ---
 
     func listenMyParties(uid: String, onChange: @escaping ([PartySummary]) -> Void) -> ListenerRegistration {
         userPartiesRef(uid: uid)
@@ -151,8 +163,7 @@ final class FirestoreService {
         )
     }
 
-    // MARK: - RSVP
-
+    // RSVP
     func setRSVP(partyId: String, uid: String, status: RSVPStatus, partySize: Int, notes: String?) async throws {
         let rsvpRef = db.collection("parties").document(partyId)
             .collection("rsvps").document(uid)
@@ -203,8 +214,7 @@ final class FirestoreService {
             }
     }
 
-    // MARK: - Polls
-
+    // POLLS
     private func pollsRef(partyId: String) -> CollectionReference {
         db.collection("parties").document(partyId).collection("polls")
     }
@@ -303,7 +313,7 @@ final class FirestoreService {
         try await votesRef(partyId: partyId, pollId: pollId).document(uid).setData([
             "type": "single",
             "selectedOptionIds": [optionId],
-            "createdAt": FieldValue.serverTimestamp()
+            "updatedAt": FieldValue.serverTimestamp()
         ], merge: true)
     }
 
@@ -311,7 +321,7 @@ final class FirestoreService {
         try await votesRef(partyId: partyId, pollId: pollId).document(uid).setData([
             "type": "multiple",
             "selectedOptionIds": optionIds,
-            "createdAt": FieldValue.serverTimestamp()
+            "updatedAt": FieldValue.serverTimestamp()
         ], merge: true)
     }
 

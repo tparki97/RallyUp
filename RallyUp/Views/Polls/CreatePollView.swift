@@ -6,9 +6,6 @@ struct CreatePollView: View {
     let partyId: String
     @Environment(\.dismiss) private var dismiss
 
-    // Config
-    private let maxOptions = 12  // cap total options
-
     // Form fields
     @State private var question: String = ""
     @State private var type: PollType = .single
@@ -17,8 +14,9 @@ struct CreatePollView: View {
     @State private var deadlineAt: Date = Calendar.current.date(byAdding: .day, value: 2, to: Date()) ?? Date()
 
     // Build options BEFORE saving
-    @State private var draftOptions: [String] = ["", ""] // at least two text fields visible
-    @State private var newOptionText: String = ""
+    // Show 3 rows by default (user can leave the 3rd blank).
+    @State private var draftOptions: [String] = ["", "", ""]
+
     @State private var isSaving = false
     @State private var errorText: String?
 
@@ -39,37 +37,34 @@ struct CreatePollView: View {
                 Toggle("Allow guests to add options", isOn: $allowGuestOptions)
             }
 
-            Section(footer:
-                Text("Add 2 to \(maxOptions) options.").font(.footnote).foregroundStyle(.secondary)
-            ) {
+            Section(header: Text("Options")) {
+                // Always render existing rows…
                 ForEach(draftOptions.indices, id: \.self) { i in
-                    HStack {
-                        if type == .ranked {
-                            Text("\(i + 1).")
-                                .foregroundStyle(.secondary)
-                                .frame(width: 24, alignment: .trailing)
-                        }
-                        TextField("Option \(i + 1)", text: Binding(
-                            get: { draftOptions[i] },
-                            set: { draftOptions[i] = $0 }
-                        ))
-                        .textInputAutocapitalization(.sentences)
-                    }
+                    TextField("Option", text: Binding(
+                        get: { draftOptions[safe: i] ?? "" },
+                        set: { draftOptions[safe: i] = $0 }
+                    ))
+                    .textInputAutocapitalization(.sentences)
                 }
-                .onDelete { idx in draftOptions.remove(atOffsets: idx) }
+                .onDelete { idx in
+                    draftOptions.remove(atOffsets: idx)
+                    // Keep at least 3 visible inputs for clarity
+                    while draftOptions.count < 3 { draftOptions.append("") }
+                }
 
-                HStack {
-                    TextField("Add an option", text: $newOptionText)
-                        .textInputAutocapitalization(.sentences)
-                    Button("Add") {
-                        let t = newOptionText.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !t.isEmpty else { return }
-                        guard cleanedOptions.count < maxOptions else { return }
-                        draftOptions.append(t)
-                        newOptionText = ""
+                // Add button reveals one more empty field each tap
+                Button {
+                    if draftOptions.count < 12 {
+                        draftOptions.append("")
                     }
-                    .disabled(newOptionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || cleanedOptions.count >= maxOptions)
+                } label: {
+                    Label("Add another option", systemImage: "plus.circle")
                 }
+                .disabled(draftOptions.count >= 12)
+
+                Text("Add 2 to 12 options. You can leave extra fields blank.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
 
             Section(header: Text("Deadline (optional)")) {
@@ -87,19 +82,26 @@ struct CreatePollView: View {
                 .disabled(!canSave || isSaving)
         }
         .navigationTitle("Create Poll")
+        .onAppear {
+            // Safety: ensure we always show at least 3 visible rows
+            while draftOptions.count < 3 { draftOptions.append("") }
+        }
     }
 
+    // Keep only trimmed, non-empty text, cap at 12
     private var cleanedOptions: [String] {
         draftOptions
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+            .prefix(12)
+            .map { String($0) }
     }
 
-    // ✅ Allow 2+ options for ALL types
     private var canSave: Bool {
         let qOK = !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let count = cleanedOptions.count
-        return qOK && count >= 2 && count <= maxOptions
+        // Allow creation with as few as 2 options for ALL types.
+        return qOK && count >= 2
     }
 
     private func save() {
@@ -111,7 +113,6 @@ struct CreatePollView: View {
         let pollRef = db.collection("parties").document(partyId).collection("polls").document()
 
         let pollData: [String: Any] = [
-            "partyId": partyId, // keep consistent for fallback query
             "type": type.rawValue,
             "question": question,
             "allowGuestOptions": allowGuestOptions,
@@ -131,7 +132,7 @@ struct CreatePollView: View {
                 "text": text,
                 "createdBy": uid,
                 "createdAt": Timestamp(date: Date()),
-                "rank": idx // also used as initial display order for ranked
+                "rank": idx     // initial display order for ranked
             ], forDocument: optRef)
         }
 
@@ -141,6 +142,18 @@ struct CreatePollView: View {
                 errorText = err.localizedDescription
             } else {
                 dismiss()
+            }
+        }
+    }
+}
+
+// Safe index subscript to avoid index warnings in bindings
+private extension Array {
+    subscript(safe index: Index) -> Element? {
+        get { indices.contains(index) ? self[index] : nil }
+        set {
+            if let newValue, indices.contains(index) {
+                self[index] = newValue
             }
         }
     }
